@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# find_sam - robust: find Windows SAM, reuse existing mounts, cd into the config dir (read-only)
+# Usage: sudo find_sam
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: run as root: sudo $0" >&2
+  exit 2
+fi
+
+# track mounts we created so we can cleanup only them
+declare -A CREATED_MOUNT=()
+cleanup() {
+  for m in "${!CREATED_MOUNT[@]}"; do
+    if mountpoint -q "$m"; then
+      echo "[*] unmounting $m"
+      umount "$m" || echo "    [!] failed to unmount $m"
+      rmdir "$m" 2>/dev/null || true
+    fi
+  done
+}
+trap cleanup EXIT
+
+idx=1
+found=0
+
+for dev in /dev/nvme*n* /dev/sd*; do
+  [ -b "$dev" ] || continue
+  base="$(basename "$dev")"
+  # crude partition check: skip whole-disk names without trailing digit
+  if [[ ! "$base" =~ [0-9]$ ]]; then
+    continue
+  fi
+
+  # get fstype (if blkid available)
+  ftype="$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)"
+  if [ -n "$ftype" ] && [ "$ftype" != "ntfs" ]; then
+    echo "[SKIP] $dev - not NTFS (TYPE=$ftype)"
+    idx=$((idx+1)); continue
+  fi
+
+  # if already mounted, use that mountpoint
+  already_mnt="$(findmnt -n -o TARGET -S "$dev" 2>/dev/null || true)"
+  if [ -n "$already_mnt" ]; then
+    echo "[*] $dev is already mounted at $already_mnt"
+    MNT="$already_mnt"
+
+    if [ -f "$MNT/Windows/System32/config/SAM" ]; then
+      echo "    [+] FOUND SAM on $dev (mounted at $MNT)"
+      found=1
+      OUT_MNT="$MNT"
+
+      cd "$MNT/Windows/System32/config" || {
+        echo "[ERR] cd failed"
+        exit 3
+      }
+
+      echo "[*] Found SAM. Launching chntpw on live SAM..."
+      exec chntpw -i SAM
+    else
+      echo "    [-] SAM not present at this mountpoint"
+      idx=$((idx+1))
+      continue
+    fi
+  fi
+
+  MNT="/mnt/win${idx}"
+  mkdir -p "$MNT"
+
+  echo "[*] Trying to mount $dev -> $MNT (detected fstype=$ftype)"
+
+  mount_err=""
+
+  if command -v ntfs-3g >/dev/null 2>&1; then
+    if ! mount_out="$(ntfs-3g -o ro,errors=ro "$dev" "$MNT" 2>&1)"; then
+      mount_err="$mount_out"
+    else
+      CREATED_MOUNT["$MNT"]=1
+    fi
+  else
+    if ! mount_out="$(mount -o ro -t ntfs "$dev" "$MNT" 2>&1)"; then
+      mount_err="$mount_out"
+    else
+      CREATED_MOUNT["$MNT"]=1
+    fi
+  fi
+
+  if [ -n "${mount_err-}" ]; then
+
+    if echo "$mount_err" | grep -qi "Device or resource busy"; then
+      echo "    [WARN] ntfs-3g: Device or resource busy. Searching for existing mount..."
+
+      existing="$(findmnt -n -o TARGET -S "$dev" 2>/dev/null || true)"
+
+      if [ -n "$existing" ]; then
+        echo "    [INFO] device already mounted at $existing"
+
+        rmdir "$MNT" 2>/dev/null || true
+        MNT="$existing"
+
+        if [ -f "$MNT/Windows/System32/config/SAM" ]; then
+          echo "    [+] FOUND SAM on $dev (mounted at $MNT)"
+          found=1
+
+          cd "$MNT/Windows/System32/config" || {
+            echo "[ERR] cd failed"
+            exit 3
+          }
+
+          echo "[*] Dropping to shell at $(pwd). Type 'exit' when done."
+          exec "${SHELL:-/bin/bash}"
+        else
+          echo "    [-] SAM not present at existing mountpoint $MNT"
+          idx=$((idx+1))
+          continue
+        fi
+      else
+        echo "    [ERR] mount failed: device busy but no mountpoint found."
+        echo "    -> Processes holding the block device (lsof):"
+
+        if command -v lsof >/dev/null 2>&1; then
+          lsof "$dev" || true
+        else
+          echo "       lsof not installed. Install lsof to see processes."
+        fi
+
+        echo "    Cleaning up temp mountdir and moving on."
+        rmdir "$MNT" 2>/dev/null || true
+
+        idx=$((idx+1))
+        continue
+      fi
+    else
+      if echo "$mount_err" | grep -qi \
+        -e hibernat \
+        -e "unsafe state" \
+        -e "unclean file system" \
+        -e "Windows is"
+      then
+        echo "    [ERR] mount failed: partition appears in hibernation / Fast Startup (unsafe)."
+        echo "          Suggestion: boot Windows, disable Fast Startup or run 'powercfg /h off' then full shutdown."
+
+      elif echo "$mount_err" | grep -qi \
+        -e "encrypted" \
+        -e "bitlocker" \
+        -e "fve"
+      then
+        echo "    [ERR] mount failed: partition may be BitLocker-encrypted or otherwise locked."
+
+      elif echo "$mount_err" | grep -qi \
+        -e "already exclusively opened" \
+        -e "already mounted"
+      then
+        echo "    [ERR] mount failed: device already in use or mounted by another process."
+
+      else
+        echo "    [ERR] mount failed: $mount_err"
+      fi
+
+      rmdir "$MNT" 2>/dev/null || true
+      idx=$((idx+1))
+      continue
+    fi
+  fi
+
+  if [ -f "$MNT/Windows/System32/config/SAM" ]; then
+    echo "    [+] FOUND SAM on $dev"
+    echo "        mountpoint: $MNT"
+    echo "        path: $MNT/Windows/System32/config/SAM"
+
+    found=1
+    OUT_MNT="$MNT"
+
+    cd "$MNT/Windows/System32/config" || {
+      echo "[ERR] cd failed"
+      exit 3
+    }
+
+    echo "[*] Dropping to shell at $(pwd). Type 'exit' when done."
+    exec "${SHELL:-/bin/bash}"
+  else
+    echo "    [-] SAM not present on $dev"
+
+    if mountpoint -q "$MNT"; then
+      umount "$MNT" || true
+      rmdir "$MNT" 2>/dev/null || true
+      unset CREATED_MOUNT["$MNT"]
+    fi
+  fi
+
+  idx=$((idx+1))
+done
+
+if [ "$found" -eq 0 ]; then
+  echo "[!] No SAM hive detected."
+  echo "Possible reasons: BitLocker, hibernation/fast-startup, RAID/dynamic volume, or no Windows present."
+  exit 4
+fi
