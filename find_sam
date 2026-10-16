@@ -1,158 +1,305 @@
 #!/usr/bin/env bash
-# find_sam - robust: find Windows SAM, reuse existing mounts, cd into the config dir (read-only)
-# Usage: sudo find_sam
-set -euo pipefail
+# find_sam - safely locate the Windows SAM hive from Linux.
+# Read-only by design: this script never remounts a Windows volume read-write
+# and never modifies Windows authentication data.
+#
+# Usage:
+#   sudo ./find_sam
+#   sudo ./find_sam --device /dev/nvme0n1p3
+#
+# Exit codes:
+#   0 = SAM found
+#   1 = generic/runtime failure
+#   2 = invalid usage / not root
+#   4 = no SAM found
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "ERROR: run as root: sudo $0" >&2
-  exit 2
-fi
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-# track mounts we created so we can cleanup only them
-declare -A CREATED_MOUNT=()
+PROG="${0##*/}"
+TARGET_DEVICE=""
+TMP_ROOT="/mnt"
+
+declare -A CREATED_MOUNTS=()
+
+log()  { printf '[*] %s\n' "$*"; }
+ok()   { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+err()  { printf '[ERR] %s\n' "$*" >&2; }
+
+die() {
+  err "$*"
+  exit 1
+}
+
+usage() {
+  cat <<EOF2
+Usage: sudo $PROG [options]
+
+Options:
+  --device DEV    Scan only one block device, e.g. /dev/nvme0n1p3
+  -h, --help      Show this help
+EOF2
+}
+
 cleanup() {
-  for m in "${!CREATED_MOUNT[@]}"; do
-    if mountpoint -q "$m"; then
-      echo "[*] unmounting $m"
-      umount "$m" || echo "    [!] failed to unmount $m"
-      rmdir "$m" 2>/dev/null || true
+  local rc=$?
+  trap - EXIT INT TERM HUP
+
+  local m
+  for m in "${!CREATED_MOUNTS[@]}"; do
+    if mountpoint -q -- "$m"; then
+      log "Unmounting temporary mount: $m"
+      if ! umount -- "$m" 2>/dev/null; then
+        warn "Could not unmount $m; it may still be busy."
+        continue
+      fi
     fi
+    rmdir -- "$m" 2>/dev/null || true
   done
+
+  exit "$rc"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
-idx=1
-found=0
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || {
+    err "Run as root: sudo $PROG"
+    exit 2
+  }
+}
 
-for dev in /dev/nvme*n* /dev/sd*; do
-  [ -b "$dev" ] || continue
-  base="$(basename "$dev")"
-  # crude partition check: skip whole-disk names without trailing digit
-  if [[ ! "$base" =~ [0-9]$ ]]; then
-    continue
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+fstype_of() {
+  blkid -s TYPE -o value -- "$1" 2>/dev/null || true
+}
+
+mountpoint_of() {
+  findmnt -rn -S "$1" -o TARGET 2>/dev/null | head -n1 || true
+}
+
+looks_bitlocker() {
+  local t="${1,,}"
+  [[ "$t" == "bitlocker" || "$t" == "bitlocker2" || "$t" == "fve" ]]
+}
+
+classify_mount_error() {
+  local raw="$1"
+  local msg="${raw,,}"
+
+  if [[ "$msg" == *hibernat* || "$msg" == *"unsafe state"* || "$msg" == *"fast startup"* ]]; then
+    err "Windows volume appears hibernated / Fast Startup is active."
+    printf '      Fully shut down Windows before retrying.\n' >&2
+    return
   fi
 
-  # get fstype (if blkid available)
-  ftype="$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)"
-  if [ -n "$ftype" ] && [ "$ftype" != "ntfs" ]; then
-    echo "[SKIP] $dev - not NTFS (TYPE=$ftype)"
-    idx=$((idx+1)); continue
+  if [[ "$msg" == *dirty* || "$msg" == *unclean* || "$msg" == *"needs recovery"* ]]; then
+    err "NTFS volume is dirty or needs filesystem recovery."
+    printf '      Let Windows repair the filesystem, then fully shut it down.\n' >&2
+    return
   fi
 
-  # if already mounted, use that mountpoint
-  already_mnt="$(findmnt -n -o TARGET -S "$dev" 2>/dev/null || true)"
-  if [ -n "$already_mnt" ]; then
-    echo "[*] $dev is already mounted at $already_mnt"
-    MNT="$already_mnt"
-    # check for SAM
-    if [ -f "$MNT/Windows/System32/config/SAM" ]; then
-      echo "    [+] FOUND SAM on $dev (mounted at $MNT)"
-      found=1
-      OUT_MNT="$MNT"
-      cd "$MNT/Windows/System32/config" || { echo "[ERR] cd failed"; exit 3; }
-      echo "[*] Found SAM. Launching chntpw on live SAM..."
-      exec chntpw -i SAM
+  if [[ "$msg" == *bitlocker* || "$msg" == *encrypted* || "$msg" == *fve* ]]; then
+    err "Volume appears BitLocker-encrypted or locked."
+    return
+  fi
 
+  if [[ "$msg" == *"device or resource busy"* || "$msg" == *"already mounted"* || "$msg" == *"exclusively opened"* ]]; then
+    err "Device is already mounted or busy."
+    return
+  fi
+
+  err "Mount failed: ${raw:-unknown error}"
+}
+
+make_mountpoint() {
+  local dev="$1"
+  local safe="${dev#/dev/}"
+  safe="${safe//\//_}"
+  local m="$TMP_ROOT/find_sam_${safe}_$$"
+  mkdir -p -- "$m"
+  printf '%s\n' "$m"
+}
+
+mount_ntfs_ro() {
+  local dev="$1" mnt="$2"
+  local output="" rc=1
+
+  if grep -qw ntfs3 /proc/filesystems 2>/dev/null; then
+    if output="$(mount -t ntfs3 -o ro -- "$dev" "$mnt" 2>&1)"; then
+      return 0
     else
-      echo "    [-] SAM not present at this mountpoint"
-      idx=$((idx+1)); continue
+      rc=$?
     fi
   fi
 
-  # not mounted -> try to mount read-only
-  MNT="/mnt/win${idx}"
-  mkdir -p "$MNT"
-  echo "[*] Trying to mount $dev -> $MNT (detected fstype=$ftype)"
-  mount_err=""
-  if command -v ntfs-3g >/dev/null 2>&1; then
-    if ! mount_out="$(ntfs-3g -o ro,errors=ro "$dev" "$MNT" 2>&1)"; then
-      mount_err="$mount_out"
+  if have_cmd ntfs-3g; then
+    if output="$(ntfs-3g -o ro -- "$dev" "$mnt" 2>&1)"; then
+      return 0
     else
-      CREATED_MOUNT["$MNT"]=1
+      rc=$?
     fi
+  fi
+
+  if output="$(mount -o ro -- "$dev" "$mnt" 2>&1)"; then
+    return 0
   else
-    if ! mount_out="$(mount -o ro -t ntfs "$dev" "$MNT" 2>&1)"; then
-      mount_err="$mount_out"
-    else
-      CREATED_MOUNT["$MNT"]=1
+    rc=$?
+  fi
+
+  printf '%s\n' "$output" >&2
+  return "$rc"
+}
+
+find_sam_path() {
+  local mnt="$1"
+  local cfg="$mnt/Windows/System32/config"
+
+  if [[ -d "$cfg" ]]; then
+    if [[ -f "$cfg/SAM" ]]; then
+      printf '%s\n' "$cfg/SAM"
+      return 0
+    fi
+
+    local candidate
+    candidate="$(find "$cfg" -maxdepth 1 -type f -iname 'SAM' -print -quit 2>/dev/null || true)"
+    if [[ -n "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
     fi
   fi
 
-  if [ -n "${mount_err-}" ]; then
-    # if device busy, find existing mount or processes holding it
-    if echo "$mount_err" | grep -qi "Device or resource busy"; then
-      echo "    [WARN] ntfs-3g: Device or resource busy. Searching for existing mount..."
-      existing="$(findmnt -n -o TARGET -S "$dev" 2>/dev/null || true)"
-      if [ -n "$existing" ]; then
-        echo "    [INFO] device already mounted at $existing"
-        rmdir "$MNT" 2>/dev/null || true
-        MNT="$existing"
-        if [ -f "$MNT/Windows/System32/config/SAM" ]; then
-          echo "    [+] FOUND SAM on $dev (mounted at $MNT)"
-          found=1
-          cd "$MNT/Windows/System32/config" || { echo "[ERR] cd failed"; exit 3; }
-          echo "[*] Dropping to shell at $(pwd). Type 'exit' when done."
-          exec "${SHELL:-/bin/bash}"
-        else
-          echo "    [-] SAM not present at existing mountpoint $MNT"
-          idx=$((idx+1)); continue
-        fi
-      else
-        # list processes that may hold the device (help debug)
-        echo "    [ERR] mount failed: device busy but no mountpoint found."
-        echo "    -> Processes holding the block device (lsof):"
-        if command -v lsof >/dev/null 2>&1; then
-          lsof "$dev" || true
-        else
-          echo "       lsof not installed. Install lsof to see processes."
-        fi
-        echo "    Cleaning up temp mountdir and moving on."
-        rmdir "$MNT" 2>/dev/null || true
-        idx=$((idx+1)); continue
-      fi
+  return 1
+}
 
-    else
-      # examine common error causes
-      if echo "$mount_err" | grep -qi -e hibernat -e "unsafe state" -e "unclean file system" -e "Windows is"; then
-        echo "    [ERR] mount failed: partition appears in hibernation / Fast Startup (unsafe)."
-        echo "          Suggestion: boot Windows, disable Fast Startup or run 'powercfg /h off' then full shutdown."
-      elif echo "$mount_err" | grep -qi -e "encrypted" -e "bitlocker" -e "fve"; then
-        echo "    [ERR] mount failed: partition may be BitLocker-encrypted or otherwise locked."
-      elif echo "$mount_err" | grep -qi -e "already exclusively opened" -e "already mounted"; then
-        echo "    [ERR] mount failed: device already in use or mounted by another process."
-      else
-        echo "    [ERR] mount failed: $mount_err"
-      fi
-      rmdir "$MNT" 2>/dev/null || true
-      idx=$((idx+1)); continue
-    fi
+scan_device() {
+  local dev="$1"
+  local fstype mnt sam mount_output
+
+  [[ -b "$dev" ]] || return 1
+  fstype="$(fstype_of "$dev")"
+
+  if looks_bitlocker "$fstype"; then
+    warn "$dev is BitLocker ($fstype); skipping locked volume."
+    return 1
   fi
 
-  # If we reach here, mount succeeded and CREATED_MOUNT tracked it
-  if [ -f "$MNT/Windows/System32/config/SAM" ]; then
-    echo "    [+] FOUND SAM on $dev"
-    echo "        mountpoint: $MNT"
-    echo "        path: $MNT/Windows/System32/config/SAM"
-    found=1
-    OUT_MNT="$MNT"
-    cd "$MNT/Windows/System32/config" || { echo "[ERR] cd failed"; exit 3; }
-    echo "[*] Dropping to shell at $(pwd). Type 'exit' when done."
-    exec "${SHELL:-/bin/bash}"
+  if [[ -n "$fstype" && "${fstype,,}" != "ntfs" && "${fstype,,}" != "ntfs3" ]]; then
+    log "Skipping $dev (filesystem: $fstype)"
+    return 1
+  fi
+
+  mnt="$(mountpoint_of "$dev")"
+  if [[ -n "$mnt" ]]; then
+    log "$dev is already mounted at $mnt"
+    if sam="$(find_sam_path "$mnt")"; then
+      ok "Found Windows SAM"
+      printf '    device:     %s\n' "$dev"
+      printf '    mountpoint: %s\n' "$mnt"
+      printf '    SAM:        %s\n' "$sam"
+      return 0
+    fi
+    log "No Windows SAM at that mountpoint."
+    return 1
+  fi
+
+  mnt="$(make_mountpoint "$dev")"
+  log "Scanning $dev read-only at $mnt"
+
+  if ! mount_output="$(mount_ntfs_ro "$dev" "$mnt" 2>&1)"; then
+    classify_mount_error "$mount_output"
+    rmdir -- "$mnt" 2>/dev/null || true
+    return 1
+  fi
+
+  CREATED_MOUNTS["$mnt"]=1
+
+  if sam="$(find_sam_path "$mnt")"; then
+    ok "Found Windows SAM"
+    printf '    device:     %s\n' "$dev"
+    printf '    mountpoint: %s\n' "$mnt"
+    printf '    SAM:        %s\n' "$sam"
+    return 0
+  fi
+
+  log "No SAM found on $dev"
+  if umount -- "$mnt" 2>/dev/null; then
+    rmdir -- "$mnt" 2>/dev/null || true
+    unset "CREATED_MOUNTS[$mnt]"
   else
-    echo "    [-] SAM not present on $dev"
-    # unmount since we created the mount
-    if mountpoint -q "$MNT"; then
-      umount "$MNT" || true
-      rmdir "$MNT" 2>/dev/null || true
-      unset CREATED_MOUNT["$MNT"]
-    fi
+    warn "Could not unmount temporary scan mount $mnt; cleanup will retry on exit."
   fi
 
-  idx=$((idx+1))
-done
+  return 1
+}
 
-if [ "$found" -eq 0 ]; then
-  echo "[!] No SAM hive detected."
-  echo "Possible reasons: BitLocker, hibernation/fast-startup, RAID/dynamic volume, or no Windows present."
-  exit 4
-fi
+list_candidate_devices() {
+  if [[ -n "$TARGET_DEVICE" ]]; then
+    [[ -b "$TARGET_DEVICE" ]] || die "Not a block device: $TARGET_DEVICE"
+    printf '%s\n' "$TARGET_DEVICE"
+    return
+  fi
+
+  lsblk -pnro NAME,TYPE,FSTYPE 2>/dev/null |
+    awk '$2 != "disk" && $2 != "rom" && $2 != "loop" {print $1}'
+}
+
+main() {
+  while (( $# > 0 )); do
+    case "$1" in
+      --device)
+        [[ $# -ge 2 ]] || {
+          err "--device requires a path"
+          exit 2
+        }
+        TARGET_DEVICE="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        err "Unknown option: $1"
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  require_root
+  require_cmd lsblk
+  require_cmd blkid
+  require_cmd findmnt
+  require_cmd mount
+  require_cmd umount
+  require_cmd mountpoint
+  require_cmd awk
+  require_cmd grep
+  require_cmd find
+
+  local dev
+  while IFS= read -r dev; do
+    [[ -n "$dev" ]] || continue
+    if scan_device "$dev"; then
+      return 0
+    fi
+  done < <(list_candidate_devices)
+
+  err "No Windows SAM hive was found."
+  printf 'Possible causes: no Windows installation, BitLocker is locked, the Windows volume\n' >&2
+  printf 'is hibernated/unavailable, or the storage layout is unsupported.\n' >&2
+  return 4
+}
+
+main "$@"
